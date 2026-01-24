@@ -22,6 +22,8 @@ Wants=redis-server.service
 [Service]
 Type=simple
 WorkingDirectory=/opt/svx-talker-ws
+Environment=SVX_POLL_INTERVAL=0.05
+Environment=WS_NOISE_REPORT_INTERVAL=30
 Environment=SVX_STATUS_URL=http://127.0.0.1:8080/status
 Environment=SVX_POLL_INTERVAL=0.5
 Environment=SVX_TTL_SECONDS=86400
@@ -129,6 +131,7 @@ server {
         proxy_buffering off;
     }
 }
+
 
 sudo nginx -t
 sudo systemctl reload nginx

@@ -2,8 +2,8 @@
 """
 svx_talker_ws.py
 
-Polls SvxReflector status endpoint, detects when a node starts/stops talking,
-stores each talk "session" in Redis with a 24h TTL, and serves BOTH:
+Polls SvxReflector status endpoint (local), detects when a node starts/stops talking,
+stores each talk "session" in Redis with a TTL (default 24h), and serves BOTH:
 
 1) Current node state (online/isTalker/tg/monitoredTGs/location/coords)
 2) Talk sessions (last 24h) and live talk start/stop events
@@ -43,18 +43,23 @@ Node state format:
 }
 
 Redis keys:
-- svx:session:<start_ms>:<callsign>  -> JSON session record, EX 86400
+- svx:session:<start_ms>:<callsign>  -> JSON session record, EX TTL
 - svx:sessions                       -> ZSET index (score=start_ms, member=session_key)
 - svx:active                         -> SET of callsigns currently talking
 
 Env vars:
-- SVX_STATUS_URL     (default http://127.0.0.1:8080/status)
-- SVX_POLL_INTERVAL  (default 0.5 seconds)
-- REDIS_URL          (default redis://127.0.0.1:6379/0)
-- SVX_TTL_SECONDS    (default 86400)
-- SVX_SNAPSHOT_LIMIT (default 500)
-- SVX_WS_HOST        (default 127.0.0.1)
-- SVX_WS_PORT        (default 8765)
+- SVX_STATUS_URL      (default http://127.0.0.1:8080/status)
+- SVX_POLL_INTERVAL   (default 0.5 seconds; try 0.1 or 0.05 if you miss short PTTs)
+- REDIS_URL           (default redis://127.0.0.1:6379/0)
+- SVX_TTL_SECONDS     (default 86400)
+- SVX_SNAPSHOT_LIMIT  (default 500)
+- SVX_WS_HOST         (default 127.0.0.1)
+- SVX_WS_PORT         (default 8765)
+
+Log-noise suppression:
+- WS_NOISE_REPORT_INTERVAL (default 60 seconds; set 0 to disable)
+  Suppresses noisy "missing Upgrade header" handshake errors (non-WS HTTP requests hitting WS port)
+  and logs a periodic summary instead.
 """
 
 from __future__ import annotations
@@ -73,6 +78,12 @@ import aiohttp
 import redis.asyncio as redis
 import websockets
 from websockets.exceptions import ConnectionClosed
+
+try:
+    # Used only to identify and suppress the noisy "missing Upgrade header" handshake spam.
+    from websockets.exceptions import InvalidUpgrade  # type: ignore
+except Exception:
+    InvalidUpgrade = None  # type: ignore
 
 
 def env_float(name: str, default: float) -> float:
@@ -97,6 +108,106 @@ def iso_from_ms(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
 
 
+async def sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
+    """Sleep for `seconds` unless stop is set."""
+    if seconds <= 0:
+        await asyncio.sleep(0)
+        return
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        return
+
+
+# -------------------- Log noise suppression --------------------
+
+class _WsNoiseCounter:
+    def __init__(self) -> None:
+        self._count = 0
+
+    def inc(self, n: int = 1) -> None:
+        self._count += n
+
+    def take(self) -> int:
+        c = self._count
+        self._count = 0
+        return c
+
+
+class _SuppressUpgradeNoise(logging.Filter):
+    """
+    Suppress noisy websockets logs when random HTTP clients hit the WS endpoint without
+    WebSocket upgrade headers. Count them and report periodically instead.
+
+    Example noise we suppress:
+    - ERROR "opening handshake failed" ... InvalidUpgrade: missing Upgrade header
+    - INFO  "connection rejected (426 Upgrade Required)"
+    """
+
+    def __init__(self, counter: _WsNoiseCounter) -> None:
+        super().__init__()
+        self.counter = counter
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Only consider websockets internal loggers
+        if not record.name.startswith("websockets"):
+            return True
+
+        msg = record.getMessage()
+
+        # Suppress the "connection rejected (426 Upgrade Required)" line (do NOT count here to avoid double counting)
+        if "connection rejected" in msg and "Upgrade Required" in msg:
+            return False
+
+        # Suppress and COUNT the stacktrace line for missing Upgrade header
+        if msg == "opening handshake failed" and record.exc_info and InvalidUpgrade is not None:
+            exc = record.exc_info[1]
+            if isinstance(exc, InvalidUpgrade):
+                # We only want to suppress the common bot/scanner case:
+                if "missing Upgrade header" in str(exc):
+                    self.counter.inc()
+                    return False
+
+        return True
+
+
+async def ws_noise_reporter(counter: _WsNoiseCounter, stop: asyncio.Event, every_s: float) -> None:
+    log = logging.getLogger("svx_talker_ws")
+    while not stop.is_set():
+        await sleep_or_stop(stop, every_s)
+        c = counter.take()
+        if c:
+            log.info(
+                "Ignored %d non-WebSocket HTTP requests to WS endpoint (missing Upgrade header).",
+                c,
+            )
+
+
+def install_ws_noise_suppression(stop: asyncio.Event) -> Optional[asyncio.Task]:
+    """
+    Install a handler filter to suppress noisy websockets handshake errors and
+    start a periodic reporter task.
+    """
+    interval = env_float("WS_NOISE_REPORT_INTERVAL", 60.0)
+    if interval <= 0:
+        return None
+
+    counter = _WsNoiseCounter()
+    flt = _SuppressUpgradeNoise(counter)
+
+    # Attach filter to root handlers (most reliable: catches all records flowing to journald)
+    root = logging.getLogger()
+    if root.handlers:
+        for h in root.handlers:
+            h.addFilter(flt)
+    else:
+        root.addFilter(flt)
+
+    return asyncio.create_task(ws_noise_reporter(counter, stop, interval), name="ws_noise_reporter")
+
+
+# -------------------- Node / session helpers --------------------
+
 def to_float(v: Any) -> Optional[float]:
     if v is None:
         return None
@@ -115,7 +226,7 @@ def to_float(v: Any) -> Optional[float]:
 
 def summarize_node(node: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Reduced subset for sessions.
+    Reduced subset for sessions (stored in Redis).
     """
     qth_summary: Optional[Dict[str, Any]] = None
     qth_list = node.get("qth") or []
@@ -148,8 +259,7 @@ def summarize_node(node: Dict[str, Any]) -> Dict[str, Any]:
 
 def make_node_state(callsign: str, node: Dict[str, Any], online: bool) -> Dict[str, Any]:
     """
-    Stable node state for the UI. Avoid fields that change every poll, otherwise
-    you'd broadcast constantly.
+    Stable node state for the UI (avoid fields that change every poll).
     """
     lat = lon = None
     qth = node.get("qth") or []
@@ -340,13 +450,11 @@ async def prune_task(r: redis.Redis, cfg: Config, stop: asyncio.Event) -> None:
             await r.zremrangebyscore(cfg.sessions_zset, 0, cutoff)
         except Exception:
             logging.exception("prune_task error")
-        await asyncio.sleep(60)
+        await sleep_or_stop(stop, 60)
 
 
 def diff_nodes(prev: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    Return list of (callsign, node_state) that changed.
-    """
+    """Return list of (callsign, node_state) that changed."""
     changed: List[Tuple[str, Dict[str, Any]]] = []
     keys = set(prev.keys()) | set(new.keys())
     for cs in keys:
@@ -368,6 +476,8 @@ async def poll_task(
     - talk start/stop
     - online/offline
     - node state changes (tg, monitoredTGs, coords, location, isTalker)
+
+    Poll period is kept close to cfg.poll_interval_s using monotonic scheduling.
     """
     prev_talkers: Set[str] = set()
     active_session_key: Dict[str, str] = {}
@@ -379,6 +489,7 @@ async def poll_task(
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while not stop.is_set():
+            loop_start = time.monotonic()
             try:
                 async with session.get(cfg.status_url) as resp:
                     resp.raise_for_status()
@@ -487,7 +598,7 @@ async def poll_task(
                     new_nodes[cs] = off
 
                 # broadcast diffs only
-                for cs, st in diff_nodes(prev_nodes, new_nodes):
+                for _cs, st in diff_nodes(prev_nodes, new_nodes):
                     await hub.broadcast({"type": "node_upsert", "node": st})
 
                 prev_nodes = new_nodes
@@ -496,7 +607,9 @@ async def poll_task(
             except Exception:
                 logging.exception("poll_task error")
 
-            await asyncio.sleep(cfg.poll_interval_s)
+            # Keep loop period close to cfg.poll_interval_s (poll time + sleep ~= interval)
+            elapsed = time.monotonic() - loop_start
+            await sleep_or_stop(stop, max(0.0, cfg.poll_interval_s - elapsed))
 
 
 async def main() -> None:
@@ -508,6 +621,7 @@ async def main() -> None:
 
     logging.info("STATUS_URL=%s", cfg.status_url)
     logging.info("REDIS_URL=%s", cfg.redis_url)
+    logging.info("POLL_INTERVAL=%.3fs", cfg.poll_interval_s)
     logging.info("WS=ws://%s:%d", cfg.ws_host, cfg.ws_port)
 
     stop = asyncio.Event()
@@ -529,10 +643,19 @@ async def main() -> None:
     hub = Hub()
     node_cache = NodeCache()
 
-    tasks = [
-        asyncio.create_task(poll_task(r, cfg, hub, stop, node_cache), name="poll_task"),
-        asyncio.create_task(prune_task(r, cfg, stop), name="prune_task"),
-    ]
+    tasks: List[asyncio.Task] = []
+
+    # suppress noisy "missing Upgrade header" handshake errors and report periodically
+    reporter_task = install_ws_noise_suppression(stop)
+    if reporter_task:
+        tasks.append(reporter_task)
+
+    tasks.extend(
+        [
+            asyncio.create_task(poll_task(r, cfg, hub, stop, node_cache), name="poll_task"),
+            asyncio.create_task(prune_task(r, cfg, stop), name="prune_task"),
+        ]
+    )
 
     # Entry point compatible with BOTH:
     # - old websockets: handler(ws, path)
@@ -564,7 +687,7 @@ async def main() -> None:
     try:
         await r.aclose()  # redis>=5
     except AttributeError:
-        await r.close()   # older redis-py
+        await r.close()  # older redis-py
 
     logging.info("Stopped.")
 
