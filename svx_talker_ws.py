@@ -56,9 +56,16 @@ Env vars:
 - SVX_WS_HOST         (default 127.0.0.1)
 - SVX_WS_PORT         (default 8765)
 
+Feed outage handling:
+- SVX_STATUS_STALE_AFTER        seconds without successful poll before marking nodes offline (default 3.0)
+- SVX_POLL_FAILURE_MAX_SLEEP    maximum backoff delay between retries when status is down (default 5.0)
+- SVX_POLL_FAILURE_LOG_EVERY    rate-limit for connection failure warnings (default 30.0)
+
 Log-noise suppression:
 - WS_NOISE_REPORT_INTERVAL (default 60 seconds; set 0 to disable)
-  Suppresses noisy "missing Upgrade header" handshake errors (non-WS HTTP requests hitting WS port)
+  Suppresses noisy handshake errors from non-WebSocket HTTP requests hitting the WS port:
+  - missing Upgrade header (plain HTTP GET)
+  - invalid HTTP request / POST, etc.
   and logs a periodic summary instead.
 """
 
@@ -80,10 +87,11 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 try:
-    # Used only to identify and suppress the noisy "missing Upgrade header" handshake spam.
-    from websockets.exceptions import InvalidUpgrade  # type: ignore
-except Exception:
+    # Used only to identify and suppress noisy handshake spam.
+    from websockets.exceptions import InvalidUpgrade, InvalidMessage  # type: ignore
+except Exception:  # pragma: no cover
     InvalidUpgrade = None  # type: ignore
+    InvalidMessage = None  # type: ignore
 
 
 def env_float(name: str, default: float) -> float:
@@ -123,25 +131,27 @@ async def sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
 
 class _WsNoiseCounter:
     def __init__(self) -> None:
-        self._count = 0
+        self._counts: Dict[str, int] = {}
 
-    def inc(self, n: int = 1) -> None:
-        self._count += n
+    def inc(self, reason: str, n: int = 1) -> None:
+        self._counts[reason] = self._counts.get(reason, 0) + n
 
-    def take(self) -> int:
-        c = self._count
-        self._count = 0
-        return c
+    def take(self) -> Dict[str, int]:
+        d = dict(self._counts)
+        self._counts.clear()
+        return d
 
 
-class _SuppressUpgradeNoise(logging.Filter):
+class _SuppressHandshakeNoise(logging.Filter):
     """
     Suppress noisy websockets logs when random HTTP clients hit the WS endpoint without
-    WebSocket upgrade headers. Count them and report periodically instead.
+    WebSocket headers or with non-GET methods. Count them and report periodically instead.
 
-    Example noise we suppress:
-    - ERROR "opening handshake failed" ... InvalidUpgrade: missing Upgrade header
-    - INFO  "connection rejected (426 Upgrade Required)"
+    Examples we suppress:
+    - InvalidUpgrade: missing Upgrade header
+    - InvalidMessage: did not receive a valid HTTP request (often from POST / scanners)
+    - ValueError: unsupported HTTP method; expected GET; got POST  (some versions surface this directly)
+    - INFO "connection rejected (426 Upgrade Required)"
     """
 
     def __init__(self, counter: _WsNoiseCounter) -> None:
@@ -155,18 +165,30 @@ class _SuppressUpgradeNoise(logging.Filter):
 
         msg = record.getMessage()
 
-        # Suppress the "connection rejected (426 Upgrade Required)" line (do NOT count here to avoid double counting)
+        # Suppress the "connection rejected (426 Upgrade Required)" line (avoid double-counting)
         if "connection rejected" in msg and "Upgrade Required" in msg:
             return False
 
-        # Suppress and COUNT the stacktrace line for missing Upgrade header
-        if msg == "opening handshake failed" and record.exc_info and InvalidUpgrade is not None:
+        # Suppress and count common handshake failures
+        if msg == "opening handshake failed" and record.exc_info:
             exc = record.exc_info[1]
-            if isinstance(exc, InvalidUpgrade):
-                # We only want to suppress the common bot/scanner case:
-                if "missing Upgrade header" in str(exc):
-                    self.counter.inc()
+
+            # Case 1: plain HTTP GET without Upgrade header
+            if InvalidUpgrade is not None and isinstance(exc, InvalidUpgrade):
+                s = str(exc)
+                if "missing Upgrade header" in s:
+                    self.counter.inc("missing_upgrade")
                     return False
+
+            # Case 2: invalid HTTP request (POST, garbage, etc.)
+            if InvalidMessage is not None and isinstance(exc, InvalidMessage):
+                self.counter.inc("invalid_http")
+                return False
+
+            # Some versions may propagate ValueError directly
+            if isinstance(exc, ValueError) and "unsupported HTTP method" in str(exc):
+                self.counter.inc("invalid_http")
+                return False
 
         return True
 
@@ -175,27 +197,27 @@ async def ws_noise_reporter(counter: _WsNoiseCounter, stop: asyncio.Event, every
     log = logging.getLogger("svx_talker_ws")
     while not stop.is_set():
         await sleep_or_stop(stop, every_s)
-        c = counter.take()
-        if c:
-            log.info(
-                "Ignored %d non-WebSocket HTTP requests to WS endpoint (missing Upgrade header).",
-                c,
-            )
+        d = counter.take()
+        if not d:
+            continue
+        total = sum(d.values())
+        parts = ", ".join(f"{k}={v}" for k, v in sorted(d.items()))
+        log.info("Ignored %d non-WebSocket requests to WS endpoint (%s).", total, parts)
 
 
 def install_ws_noise_suppression(stop: asyncio.Event) -> Optional[asyncio.Task]:
     """
-    Install a handler filter to suppress noisy websockets handshake errors and
-    start a periodic reporter task.
+    Install a filter to suppress noisy websockets handshake errors and start
+    a periodic reporter task.
     """
     interval = env_float("WS_NOISE_REPORT_INTERVAL", 60.0)
     if interval <= 0:
         return None
 
     counter = _WsNoiseCounter()
-    flt = _SuppressUpgradeNoise(counter)
+    flt = _SuppressHandshakeNoise(counter)
 
-    # Attach filter to root handlers (most reliable: catches all records flowing to journald)
+    # Attach filter to root handlers (most reliable: catches all records going to journald)
     root = logging.getLogger()
     if root.handlers:
         for h in root.handlers:
@@ -225,9 +247,7 @@ def to_float(v: Any) -> Optional[float]:
 
 
 def summarize_node(node: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Reduced subset for sessions (stored in Redis).
-    """
+    """Reduced subset for sessions (stored in Redis)."""
     qth_summary: Optional[Dict[str, Any]] = None
     qth_list = node.get("qth") or []
     if isinstance(qth_list, list) and qth_list:
@@ -258,9 +278,7 @@ def summarize_node(node: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def make_node_state(callsign: str, node: Dict[str, Any], online: bool) -> Dict[str, Any]:
-    """
-    Stable node state for the UI (avoid fields that change every poll).
-    """
+    """Stable node state for the UI (avoid fields that change every poll)."""
     lat = lon = None
     qth = node.get("qth") or []
     if isinstance(qth, list) and qth and isinstance(qth[0], dict):
@@ -302,6 +320,15 @@ def make_node_state(callsign: str, node: Dict[str, Any], online: bool) -> Dict[s
 class Config:
     status_url: str = os.getenv("SVX_STATUS_URL", "http://127.0.0.1:8080/status")
     poll_interval_s: float = env_float("SVX_POLL_INTERVAL", 0.5)
+
+    # When status can't be fetched for this many seconds, mark nodes offline + close talk sessions.
+    status_stale_after_s: float = env_float("SVX_STATUS_STALE_AFTER", 3.0)
+
+    # When status is down, use exponential backoff but cap the delay.
+    poll_failure_max_sleep_s: float = env_float("SVX_POLL_FAILURE_MAX_SLEEP", 5.0)
+
+    # Rate-limit warnings about status fetch failures.
+    poll_failure_log_every_s: float = env_float("SVX_POLL_FAILURE_LOG_EVERY", 30.0)
 
     redis_url: str = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
     ttl_seconds: int = env_int("SVX_TTL_SECONDS", 24 * 60 * 60)  # 24h
@@ -464,6 +491,83 @@ def diff_nodes(prev: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]]) 
     return changed
 
 
+async def close_active_sessions_due_to_stale(
+    r: redis.Redis,
+    cfg: Config,
+    hub: Hub,
+    prev_talkers: Set[str],
+    active_session_key: Dict[str, str],
+) -> Tuple[Set[str], Dict[str, str]]:
+    """
+    If the status feed is stale/unreachable, close any active talk sessions so the UI doesn't
+    remain stuck on "Now".
+    """
+    if not prev_talkers:
+        return set(), active_session_key
+
+    end_ms = now_ms()
+    for callsign in sorted(prev_talkers):
+        session_key = active_session_key.pop(callsign, "")
+        if session_key:
+            raw = await r.get(session_key)
+            if raw:
+                try:
+                    record = json.loads(raw)
+                except Exception:
+                    record = {"callsign": callsign}
+            else:
+                record = {"callsign": callsign}
+
+            record.update(
+                {
+                    "end_ms": end_ms,
+                    "end": iso_from_ms(end_ms),
+                    "active": False,
+                    "reason": "status_unreachable",
+                }
+            )
+            await r.set(session_key, json.dumps(record, ensure_ascii=False), ex=cfg.ttl_seconds)
+        else:
+            record = {
+                "callsign": callsign,
+                "start_ms": None,
+                "start": None,
+                "end_ms": end_ms,
+                "end": iso_from_ms(end_ms),
+                "active": False,
+                "reason": "status_unreachable",
+            }
+
+        await r.srem(cfg.active_set, callsign)
+        await hub.broadcast({"type": "talk_stop", "session": record})
+
+    return set(), active_session_key
+
+
+async def mark_all_nodes_offline(
+    hub: Hub,
+    node_cache: NodeCache,
+    prev_nodes: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Set all nodes to offline/isTalker False and broadcast only differences.
+    """
+    new_nodes = dict(prev_nodes)
+    for cs, st in list(new_nodes.items()):
+        if st.get("online") is True or st.get("isTalker") is True or st.get("tg", 0) != 0:
+            off = dict(st)
+            off["online"] = False
+            off["isTalker"] = False
+            off["tg"] = 0
+            new_nodes[cs] = off
+
+    for _cs, st in diff_nodes(prev_nodes, new_nodes):
+        await hub.broadcast({"type": "node_upsert", "node": st})
+
+    await node_cache.replace(new_nodes)
+    return new_nodes
+
+
 async def poll_task(
     r: redis.Redis,
     cfg: Config,
@@ -477,29 +581,45 @@ async def poll_task(
     - online/offline
     - node state changes (tg, monitoredTGs, coords, location, isTalker)
 
-    Poll period is kept close to cfg.poll_interval_s using monotonic scheduling.
+    Robustness:
+    - If status endpoint is unreachable, we use backoff + rate-limited logs.
+    - If unreachable for cfg.status_stale_after_s, mark all nodes offline and close active talk sessions.
     """
+    log = logging.getLogger("svx_talker_ws")
+
     prev_talkers: Set[str] = set()
     active_session_key: Dict[str, str] = {}
 
-    # callsign -> node_state (includes offline nodes we've seen before)
     prev_nodes: Dict[str, Dict[str, Any]] = {}
+
+    # monotonic timestamps for outage logic
+    last_success_m = time.monotonic()
+    failure_count = 0
+    stale_applied = False
+    last_fail_log_m = 0.0
 
     timeout = aiohttp.ClientTimeout(total=5)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while not stop.is_set():
             loop_start = time.monotonic()
+
             try:
                 async with session.get(cfg.status_url) as resp:
                     resp.raise_for_status()
                     payload = await resp.json(content_type=None)
 
+                # success
+                if failure_count > 0:
+                    log.info("Status endpoint recovered after %d failures.", failure_count)
+                failure_count = 0
+                stale_applied = False
+                last_success_m = time.monotonic()
+
                 nodes = payload.get("nodes") or {}
                 if not isinstance(nodes, dict):
                     nodes = {}
 
-                # Build online set and talkers
                 current_online: Dict[str, Dict[str, Any]] = {}
                 talker_raw: Dict[str, Dict[str, Any]] = {}
 
@@ -562,7 +682,6 @@ async def poll_task(
                         record.update({"end_ms": end_ms, "end": iso_from_ms(end_ms), "active": False})
                         await r.set(session_key, json.dumps(record, ensure_ascii=False), ex=cfg.ttl_seconds)
                     else:
-                        # If we restarted mid-talk, we may not know start_ms. Still emit stop.
                         record = {
                             "callsign": callsign,
                             "start_ms": None,
@@ -604,12 +723,54 @@ async def poll_task(
                 prev_nodes = new_nodes
                 await node_cache.replace(prev_nodes)
 
-            except Exception:
-                logging.exception("poll_task error")
+                # sleep to maintain configured poll interval
+                elapsed = time.monotonic() - loop_start
+                await sleep_or_stop(stop, max(0.0, cfg.poll_interval_s - elapsed))
+                continue
 
-            # Keep loop period close to cfg.poll_interval_s (poll time + sleep ~= interval)
-            elapsed = time.monotonic() - loop_start
-            await sleep_or_stop(stop, max(0.0, cfg.poll_interval_s - elapsed))
+            except (
+                aiohttp.ClientConnectorError,
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientResponseError,
+                aiohttp.ClientPayloadError,
+                aiohttp.ServerTimeoutError,
+                asyncio.TimeoutError,
+                ConnectionRefusedError,
+                OSError,
+            ) as e:
+                # status endpoint unreachable (expected sometimes during restart)
+                failure_count += 1
+
+                now_m = time.monotonic()
+                if (now_m - last_fail_log_m) >= cfg.poll_failure_log_every_s:
+                    log.warning("Status poll failed (%s).", e)
+                    last_fail_log_m = now_m
+
+                # If stale for too long, push offline state once + close active talk sessions
+                stale_for = now_m - last_success_m
+                if (stale_for >= cfg.status_stale_after_s) and not stale_applied:
+                    log.warning(
+                        "Status feed unreachable for %.1fs: marking nodes offline and closing active sessions.",
+                        stale_for,
+                    )
+                    prev_talkers, active_session_key = await close_active_sessions_due_to_stale(
+                        r, cfg, hub, prev_talkers, active_session_key
+                    )
+                    prev_nodes = await mark_all_nodes_offline(hub, node_cache, prev_nodes)
+                    stale_applied = True
+
+                # Backoff delay
+                backoff = cfg.poll_interval_s * (2 ** min(failure_count, 6))
+                delay = min(cfg.poll_failure_max_sleep_s, max(cfg.poll_interval_s, backoff))
+                await sleep_or_stop(stop, delay)
+                continue
+
+            except Exception:
+                # Unexpected error: keep traceback but don't spin too fast
+                failure_count += 1
+                logging.exception("poll_task unexpected error")
+                await sleep_or_stop(stop, min(cfg.poll_failure_max_sleep_s, 2.0))
+                continue
 
 
 async def main() -> None:
@@ -645,7 +806,6 @@ async def main() -> None:
 
     tasks: List[asyncio.Task] = []
 
-    # suppress noisy "missing Upgrade header" handshake errors and report periodically
     reporter_task = install_ws_noise_suppression(stop)
     if reporter_task:
         tasks.append(reporter_task)

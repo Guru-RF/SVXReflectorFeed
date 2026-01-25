@@ -23,7 +23,10 @@ Wants=redis-server.service
 Type=simple
 WorkingDirectory=/opt/svx-talker-ws
 Environment=SVX_POLL_INTERVAL=0.05
-Environment=WS_NOISE_REPORT_INTERVAL=30
+Environment=WS_NOISE_REPORT_INTERVAL=60
+Environment=SVX_STATUS_STALE_AFTER=3
+Environment=SVX_POLL_FAILURE_MAX_SLEEP=5
+Environment=SVX_POLL_FAILURE_LOG_EVERY=30
 Environment=SVX_STATUS_URL=http://127.0.0.1:8080/status
 Environment=SVX_POLL_INTERVAL=0.5
 Environment=SVX_TTL_SECONDS=86400
