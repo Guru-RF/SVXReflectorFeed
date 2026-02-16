@@ -142,3 +142,26 @@ sudo systemctl reload nginx
 testing (on mac)
 brew install websocat
 websocat wss://<url>
+
+[Unit]
+Description=SvxReflector Talker WebSocket + Redis TTL bridge
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/svx-talker-ws
+Environment=SVX_STATUS_URL=http://127.0.0.1:8080/status
+Environment=SVX_POLL_INTERVAL=0.5
+Environment=SVX_TTL_SECONDS=86400
+Environment=REDIS_URL=redis://127.0.0.1:6379/0
+Environment=SVX_WS_HOST=127.0.0.1
+Environment=SVX_WS_PORT=8765
+ExecStart=/opt/svx-talker-ws/.venv/bin/python /opt/svx-talker-ws/svx_talker_ws.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+
+sudo journalctl -u svx-talker-ws -f
