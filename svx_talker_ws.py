@@ -342,6 +342,12 @@ class Config:
     sessions_zset: str = os.getenv("SVX_SESSIONS_ZSET", "svx:sessions")
     active_set: str = os.getenv("SVX_ACTIVE_SET", "svx:active")
 
+    # AI feed bridge — SvxLink-AI publishes detected callsigns here. We
+    # subscribe and re-broadcast each session as a brief talk_start/talk_stop
+    # pair so portal clients see them live, not only on snapshot refresh.
+    ai_channel: str = os.getenv("SVX_AI_CHANNEL", "svx:ai:events")
+    ai_linger_s: float = env_float("SVX_AI_LINGER_SECONDS", 1.5)
+
 
 class NodeCache:
     def __init__(self) -> None:
@@ -478,6 +484,60 @@ async def prune_task(r: redis.Redis, cfg: Config, stop: asyncio.Event) -> None:
         except Exception:
             logging.exception("prune_task error")
         await sleep_or_stop(stop, 60)
+
+
+async def ai_subscribe_task(
+    r: redis.Redis,
+    cfg: Config,
+    hub: Hub,
+    stop: asyncio.Event,
+) -> None:
+    """
+    Subscribe to SvxLink-AI's pub/sub channel and re-broadcast each
+    ai_session event as a talk_start + (linger) + talk_stop pair so portal
+    clients see AI-detected callsigns live instead of only on snapshot
+    refresh. Reconnects on transient Redis errors.
+    """
+    while not stop.is_set():
+        try:
+            pubsub = r.pubsub(ignore_subscribe_messages=True)
+            await pubsub.subscribe(cfg.ai_channel)
+            logging.info("AI bridge subscribed to %s (linger=%.1fs)",
+                         cfg.ai_channel, cfg.ai_linger_s)
+            async for msg in pubsub.listen():
+                if stop.is_set():
+                    break
+                if not msg or msg.get("type") != "message":
+                    continue
+                try:
+                    raw = msg["data"]
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="replace")
+                    payload = json.loads(raw)
+                except Exception:
+                    logging.warning("ai_subscribe: bad JSON payload")
+                    continue
+                if payload.get("type") != "ai_session":
+                    continue
+                session = payload.get("session") or {}
+                if not session.get("callsign"):
+                    continue
+                start_evt = dict(session); start_evt["active"] = True
+                stop_evt  = dict(session); stop_evt["active"]  = False
+                await hub.broadcast({"type": "talk_start", "session": start_evt})
+                # Keep the bubble visible briefly before closing it.
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=cfg.ai_linger_s)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                await hub.broadcast({"type": "talk_stop", "session": stop_evt})
+        except Exception as e:
+            logging.warning("ai_subscribe: %s (reconnect in 2s)", e)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
 
 
 def diff_nodes(prev: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
@@ -814,6 +874,7 @@ async def main() -> None:
         [
             asyncio.create_task(poll_task(r, cfg, hub, stop, node_cache), name="poll_task"),
             asyncio.create_task(prune_task(r, cfg, stop), name="prune_task"),
+            asyncio.create_task(ai_subscribe_task(r, cfg, hub, stop), name="ai_subscribe_task"),
         ]
     )
 
