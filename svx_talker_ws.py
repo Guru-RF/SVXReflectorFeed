@@ -341,6 +341,7 @@ class Config:
     session_prefix: str = os.getenv("SVX_SESSION_PREFIX", "svx:session")
     sessions_zset: str = os.getenv("SVX_SESSIONS_ZSET", "svx:sessions")
     active_set: str = os.getenv("SVX_ACTIVE_SET", "svx:active")
+    nodes_key: str = os.getenv("SVX_NODES_KEY", "svx:nodes")
 
 
 class NodeCache:
@@ -355,6 +356,10 @@ class NodeCache:
     async def list_nodes(self) -> List[Dict[str, Any]]:
         async with self._lock:
             return list(self._nodes.values())
+
+    async def has(self, callsign: str) -> bool:
+        async with self._lock:
+            return callsign in self._nodes
 
 
 class Hub:
@@ -480,6 +485,114 @@ async def prune_task(r: redis.Redis, cfg: Config, stop: asyncio.Event) -> None:
         await sleep_or_stop(stop, 60)
 
 
+async def ai_rebroadcast_task(
+    r: redis.Redis,
+    hub: Hub,
+    node_cache: NodeCache,
+    stop: asyncio.Event,
+) -> None:
+    """
+    Subscribe to SvxLink-AI's pub/sub channel (svx:ai:events) and
+    re-broadcast each session_updated event as a brief talking burst:
+
+        node_upsert (ghost, online=True, isTalker=True)
+        talk_start  (session, active=True)
+        ... linger SVX_AI_LINGER_SECONDS ...
+        node_upsert (ghost, online=False, isTalker=False)
+        talk_stop   (session, active=False)
+
+    Synthesises the ghost node from the session's own `node` block so the
+    portal renders the AI-detected callsign at the operator's coordinates
+    (which SvxLink-AI can override via a QRZ lookup) with a live talking
+    indicator — without any portal-side changes.
+    """
+    channel = os.getenv("SVX_AI_CHANNEL", "svx:ai:events")
+    linger  = env_float("SVX_AI_LINGER_SECONDS", 1.5)
+
+    def _to_float(v):
+        try:
+            return float(v) if v not in (None, "") else None
+        except Exception:
+            return None
+
+    while not stop.is_set():
+        try:
+            pubsub = r.pubsub(ignore_subscribe_messages=True)
+            await pubsub.subscribe(channel)
+            logging.info("AI rebroadcast subscribed to %s (linger=%.1fs)",
+                         channel, linger)
+            async for msg in pubsub.listen():
+                if stop.is_set():
+                    break
+                if not msg or msg.get("type") != "message":
+                    continue
+                try:
+                    raw = msg["data"]
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="replace")
+                    payload = json.loads(raw)
+                except Exception:
+                    logging.warning("ai_rebroadcast: bad JSON payload")
+                    continue
+                if payload.get("type") != "session_updated":
+                    continue
+                session = payload.get("session") or {}
+                callsign = session.get("callsign")
+                if not callsign:
+                    continue
+
+                # If this callsign is a real reflector node tracked by
+                # poll_task, skip — broadcasting a ghost would clobber the
+                # real node's state in the portal and poll_task won't
+                # re-emit until its own cache diff fires.
+                if await node_cache.has(callsign):
+                    logging.debug(
+                        "ai_rebroadcast: skipping %s (matches real node)",
+                        callsign,
+                    )
+                    continue
+
+                src_node = session.get("node") or {}
+                qth      = src_node.get("qth") or {}
+                try:
+                    tg = int(src_node.get("tg") or 0)
+                except Exception:
+                    tg = 0
+
+                ghost_on = {
+                    "callsign":     callsign,
+                    "online":       True,
+                    "isTalker":     True,
+                    "tg":           tg,
+                    "monitoredTGs": [tg] if tg else [],
+                    "location":     (src_node.get("nodeLocation") or "AI-detected"),
+                    "lat":          _to_float(qth.get("lat")),
+                    "lon":          _to_float(qth.get("long")),
+                }
+                ghost_off = dict(ghost_on)
+                ghost_off["online"]   = False
+                ghost_off["isTalker"] = False
+
+                start_evt = dict(session); start_evt["active"] = True
+                stop_evt  = dict(session); stop_evt["active"]  = False
+
+                await hub.broadcast({"type": "node_upsert", "node": ghost_on})
+                await hub.broadcast({"type": "talk_start", "session": start_evt})
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=linger)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                await hub.broadcast({"type": "node_upsert", "node": ghost_off})
+                await hub.broadcast({"type": "talk_stop", "session": stop_evt})
+        except Exception as e:
+            logging.warning("ai_rebroadcast: %s (reconnect in 2s)", e)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+
+
 
 def diff_nodes(prev: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
     """Return list of (callsign, node_state) that changed."""
@@ -490,6 +603,41 @@ def diff_nodes(prev: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]]) 
             if cs in new:
                 changed.append((cs, new[cs]))
     return changed
+
+
+async def load_nodes_from_redis(r: redis.Redis, cfg: Config) -> Dict[str, Dict[str, Any]]:
+    """
+    Load the persisted node roster from Redis. Returns all known callsigns
+    forced to offline — the next successful poll will re-confirm whichever
+    are actually online.
+    """
+    raw = await r.hgetall(cfg.nodes_key)
+    out: Dict[str, Dict[str, Any]] = {}
+    for cs, val in raw.items():
+        try:
+            st = json.loads(val)
+        except Exception:
+            continue
+        if not isinstance(st, dict):
+            continue
+        st["online"] = False
+        st["isTalker"] = False
+        st["tg"] = 0
+        out[str(cs).upper()] = st
+    return out
+
+
+async def save_nodes_to_redis(
+    r: redis.Redis,
+    cfg: Config,
+    changed: List[Tuple[str, Dict[str, Any]]],
+) -> None:
+    if not changed:
+        return
+    pipe = r.pipeline()
+    for cs, st in changed:
+        pipe.hset(cfg.nodes_key, cs, json.dumps(st, ensure_ascii=False))
+    await pipe.execute()
 
 
 async def close_active_sessions_due_to_stale(
@@ -546,12 +694,14 @@ async def close_active_sessions_due_to_stale(
 
 
 async def mark_all_nodes_offline(
+    r: redis.Redis,
+    cfg: Config,
     hub: Hub,
     node_cache: NodeCache,
     prev_nodes: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Set all nodes to offline/isTalker False and broadcast only differences.
+    Set all nodes to offline/isTalker False and broadcast + persist diffs.
     """
     new_nodes = dict(prev_nodes)
     for cs, st in list(new_nodes.items()):
@@ -562,10 +712,12 @@ async def mark_all_nodes_offline(
             off["tg"] = 0
             new_nodes[cs] = off
 
-    for _cs, st in diff_nodes(prev_nodes, new_nodes):
+    changes = diff_nodes(prev_nodes, new_nodes)
+    for _cs, st in changes:
         await hub.broadcast({"type": "node_upsert", "node": st})
 
     await node_cache.replace(new_nodes)
+    await save_nodes_to_redis(r, cfg, changes)
     return new_nodes
 
 
@@ -591,7 +743,13 @@ async def poll_task(
     prev_talkers: Set[str] = set()
     active_session_key: Dict[str, str] = {}
 
-    prev_nodes: Dict[str, Dict[str, Any]] = {}
+    # Restore the node roster from Redis so we remember offline nodes across
+    # restarts. Everything is forced offline; the first successful poll will
+    # flip the currently-connected ones back to online.
+    prev_nodes: Dict[str, Dict[str, Any]] = await load_nodes_from_redis(r, cfg)
+    if prev_nodes:
+        log.info("Restored %d nodes from Redis (all marked offline).", len(prev_nodes))
+        await node_cache.replace(prev_nodes)
 
     # monotonic timestamps for outage logic
     last_success_m = time.monotonic()
@@ -717,12 +875,14 @@ async def poll_task(
                     off["tg"] = 0
                     new_nodes[cs] = off
 
-                # broadcast diffs only
-                for _cs, st in diff_nodes(prev_nodes, new_nodes):
+                # broadcast diffs only + persist them
+                changes = diff_nodes(prev_nodes, new_nodes)
+                for _cs, st in changes:
                     await hub.broadcast({"type": "node_upsert", "node": st})
 
                 prev_nodes = new_nodes
                 await node_cache.replace(prev_nodes)
+                await save_nodes_to_redis(r, cfg, changes)
 
                 # sleep to maintain configured poll interval
                 elapsed = time.monotonic() - loop_start
@@ -757,7 +917,7 @@ async def poll_task(
                     prev_talkers, active_session_key = await close_active_sessions_due_to_stale(
                         r, cfg, hub, prev_talkers, active_session_key
                     )
-                    prev_nodes = await mark_all_nodes_offline(hub, node_cache, prev_nodes)
+                    prev_nodes = await mark_all_nodes_offline(r, cfg, hub, node_cache, prev_nodes)
                     stale_applied = True
 
                 # Backoff delay
@@ -815,6 +975,7 @@ async def main() -> None:
         [
             asyncio.create_task(poll_task(r, cfg, hub, stop, node_cache), name="poll_task"),
             asyncio.create_task(prune_task(r, cfg, stop), name="prune_task"),
+            asyncio.create_task(ai_rebroadcast_task(r, hub, node_cache, stop), name="ai_rebroadcast_task"),
         ]
     )
 
