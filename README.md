@@ -1,19 +1,48 @@
+# SVXReflectorFeed
+
+Polls a local SvxReflector `/status` endpoint, tracks talk sessions in Redis
+(TTL by default 24h), and serves live node state + talk start/stop events
+over a WebSocket. Optionally re-broadcasts SvxLink-AI sessions (callsigns
+detected by the AI bridge) as short live talking bursts on the same WS.
+
+## Requirements
+
+- Debian / Ubuntu (instructions assume `apt`)
+- Python 3.11+
+- Redis 6+
+- Nginx + Let's Encrypt (only if you want TLS / public access)
+
+## Install
+
+```bash
+# System packages
 sudo apt update
 sudo apt install -y redis-server python3.11-venv
 sudo systemctl enable --now redis-server
 
+# Place the repo at /opt/svx-talker-ws
+sudo mv /path/to/SVXReflectorFeed /opt/svx-talker-ws
+cd /opt/svx-talker-ws
+
+# Python venv + deps
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install aiohttp redis websockets
+```
 
+Test-run in the foreground:
+
+```bash
 source .venv/bin/activate
 python3 svx_talker_ws.py
+```
 
-mv this repo to /opt/svx-talker-ws/
+## systemd service
 
-/etc/systemd/system/svx-talker-ws.service
+Create `/etc/systemd/system/svx-talker-ws.service`:
 
+```ini
 [Unit]
 Description=SvxReflector Talker WebSocket + Redis TTL bridge
 After=network.target redis-server.service
@@ -22,69 +51,78 @@ Wants=redis-server.service
 [Service]
 Type=simple
 WorkingDirectory=/opt/svx-talker-ws
-Environment=SVX_POLL_INTERVAL=0.05
-Environment=WS_NOISE_REPORT_INTERVAL=60
-Environment=SVX_STATUS_STALE_AFTER=3
-Environment=SVX_POLL_FAILURE_MAX_SLEEP=5
-Environment=SVX_POLL_FAILURE_LOG_EVERY=30
 Environment=SVX_STATUS_URL=http://127.0.0.1:8080/status
 Environment=SVX_POLL_INTERVAL=0.5
 Environment=SVX_TTL_SECONDS=86400
 Environment=REDIS_URL=redis://127.0.0.1:6379/0
 Environment=SVX_WS_HOST=127.0.0.1
 Environment=SVX_WS_PORT=8765
+Environment=SVX_STATUS_STALE_AFTER=3
+Environment=SVX_POLL_FAILURE_MAX_SLEEP=5
+Environment=SVX_POLL_FAILURE_LOG_EVERY=30
+Environment=WS_NOISE_REPORT_INTERVAL=60
+# SvxLink-AI bridge (optional)
+Environment=SVX_AI_CHANNEL=svx:ai:events
+Environment=SVX_AI_LINGER_SECONDS=1.5
 ExecStart=/opt/svx-talker-ws/.venv/bin/python /opt/svx-talker-ws/svx_talker_ws.py
 Restart=always
 RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
+```
 
+Enable + tail:
+
+```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now svx-talker-ws
 sudo journalctl -u svx-talker-ws -f
+```
 
+## Nginx + TLS (optional, for public `wss://`)
 
-sudo apt update
+```bash
 sudo apt install -y nginx certbot python3-certbot-nginx
-
 sudo mkdir -p /var/www/letsencrypt/.well-known/acme-challenge
 sudo chown -R www-data:www-data /var/www/letsencrypt
+```
 
-vi /etc/nginx/sites-available/svx-ws
+Start with a bootstrap HTTP-only config at `/etc/nginx/sites-available/svx-ws`
+so certbot can complete the ACME challenge:
 
+```nginx
 server {
     listen 80;
     listen [::]:80;
     server_name ws.example.com;
 
-    # ACME challenge (Let's Encrypt)
     location ^~ /.well-known/acme-challenge/ {
         root /var/www/letsencrypt;
         default_type "text/plain";
     }
 
-    # For now, return something simple (we'll change to redirect after cert exists)
     location / {
         return 200 "OK (HTTP). SSL not enabled yet.\n";
         add_header Content-Type text/plain;
     }
 }
+```
 
+```bash
 sudo ln -sf /etc/nginx/sites-available/svx-ws /etc/nginx/sites-enabled/svx-ws
-sudo rm -f /etc/nginx/sites-enabled/default   # optional, avoids conflicts
-sudo nginx -t
-sudo systemctl reload nginx
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
 
-sudo certbot certonly \
-  --webroot -w /var/www/letsencrypt \
-  -d ws.example.com \
-  --email you@example.com --agree-tos --no-eff-email
+sudo certbot certonly --webroot -w /var/www/letsencrypt \
+    -d ws.example.com \
+    --email you@example.com --agree-tos --no-eff-email
+```
 
-(replace nginx config)
-vi /etc/nginx/sites-available/svx-ws
+Replace the config with the WebSocket reverse-proxy version:
 
-# --- HTTP: only for ACME + redirect everything else to HTTPS ---
+```nginx
+# HTTP: ACME + redirect to HTTPS
 server {
     listen 80;
     listen [::]:80;
@@ -100,7 +138,7 @@ server {
     }
 }
 
-# --- HTTPS: WebSocket reverse proxy ---
+# HTTPS: WebSocket reverse proxy
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
@@ -108,60 +146,63 @@ server {
 
     ssl_certificate     /etc/letsencrypt/live/ws.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/ws.example.com/privkey.pem;
-
-    # Reasonable modern TLS defaults
     ssl_protocols TLSv1.2 TLSv1.3;
 
-    # WebSocket connections are long-lived; prevent idle timeouts
+    # WS connections are long-lived
     proxy_read_timeout  3600s;
     proxy_send_timeout  3600s;
 
     location / {
         proxy_pass http://127.0.0.1:8765;
 
-        # WebSocket upgrade (required)
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
 
-        # Usual proxy headers
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # Lower latency for WS
         proxy_buffering off;
     }
 }
+```
 
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
 
-sudo nginx -t
-sudo systemctl reload nginx
+## Testing
 
-testing (on mac)
+From a Mac:
+
+```bash
 brew install websocat
-websocat wss://<url>
+websocat wss://ws.example.com
+```
 
-[Unit]
-Description=SvxReflector Talker WebSocket + Redis TTL bridge
-After=network.target redis-server.service
-Wants=redis-server.service
+On connect, the server sends a `snapshot` message; thereafter you'll receive
+`node_upsert`, `talk_start`, and `talk_stop` events live.
 
-[Service]
-Type=simple
-WorkingDirectory=/opt/svx-talker-ws
-Environment=SVX_STATUS_URL=http://127.0.0.1:8080/status
-Environment=SVX_POLL_INTERVAL=0.5
-Environment=SVX_TTL_SECONDS=86400
-Environment=REDIS_URL=redis://127.0.0.1:6379/0
-Environment=SVX_WS_HOST=127.0.0.1
-Environment=SVX_WS_PORT=8765
-ExecStart=/opt/svx-talker-ws/.venv/bin/python /opt/svx-talker-ws/svx_talker_ws.py
-Restart=always
-RestartSec=2
+## Environment variables
 
-[Install]
-WantedBy=multi-user.target
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SVX_STATUS_URL` | `http://127.0.0.1:8080/status` | SvxReflector status endpoint |
+| `SVX_POLL_INTERVAL` | `0.5` | Poll interval (s); try `0.1` or `0.05` for short PTTs |
+| `REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis connection |
+| `SVX_TTL_SECONDS` | `86400` | Session retention (s) |
+| `SVX_SNAPSHOT_LIMIT` | `500` | Max sessions in connect snapshot |
+| `SVX_WS_HOST` | `127.0.0.1` | WS bind host |
+| `SVX_WS_PORT` | `8765` | WS bind port |
+| `SVX_STATUS_STALE_AFTER` | `3.0` | Mark nodes offline after this many seconds without a successful poll |
+| `SVX_POLL_FAILURE_MAX_SLEEP` | `5.0` | Max backoff between failed polls |
+| `SVX_POLL_FAILURE_LOG_EVERY` | `30.0` | Rate-limit for poll-failure warnings |
+| `WS_NOISE_REPORT_INTERVAL` | `60` | Periodic summary of suppressed non-WS HTTP hits (`0` disables) |
+| `SVX_AI_CHANNEL` | `svx:ai:events` | Pub/sub channel for SvxLink-AI sessions |
+| `SVX_AI_LINGER_SECONDS` | `1.5` | How long an AI-detected callsign stays "talking" on the WS |
 
-sudo journalctl -u svx-talker-ws -f
+## License
+
+[MIT](LICENSE) © Joeri Van Dooren
