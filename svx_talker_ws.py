@@ -30,6 +30,10 @@ WebSocket messages (JSON):
 - On talk stop:
   {"type":"talk_stop","session":{session}}
 
+- When a node has been offline longer than SVX_OFFLINE_PRUNE_AFTER and is dropped:
+  {"type":"node_remove","callsign":"ON0XXX"}
+  (clients should remove this callsign from their local roster)
+
 Node state format:
 {
   "callsign": "ON0XXX",
@@ -39,7 +43,8 @@ Node state format:
   "monitoredTGs": [8, 1745],
   "location": "Gent",
   "lat": 51.0450,
-  "lon": 3.7017
+  "lon": 3.7017,
+  "offline_since_ms": 1700000000000   // present only while offline
 }
 
 Redis keys:
@@ -53,6 +58,7 @@ Env vars:
 - REDIS_URL           (default redis://127.0.0.1:6379/0)
 - SVX_TTL_SECONDS     (default 86400)
 - SVX_SNAPSHOT_LIMIT  (default 500)
+- SVX_OFFLINE_PRUNE_AFTER  seconds a node may stay offline before it's dropped (default 86400; 0 disables)
 - SVX_WS_HOST         (default 127.0.0.1)
 - SVX_WS_PORT         (default 8765)
 
@@ -334,6 +340,10 @@ class Config:
     ttl_seconds: int = env_int("SVX_TTL_SECONDS", 24 * 60 * 60)  # 24h
     snapshot_limit: int = env_int("SVX_SNAPSHOT_LIMIT", 500)
 
+    # Drop nodes that have been offline for at least this many seconds (default 24h).
+    # Set to 0 to keep offline nodes forever (previous behaviour).
+    offline_prune_after_s: float = env_float("SVX_OFFLINE_PRUNE_AFTER", 24 * 60 * 60)
+
     ws_host: str = os.getenv("SVX_WS_HOST", "127.0.0.1")
     ws_port: int = env_int("SVX_WS_PORT", 8765)
 
@@ -611,6 +621,7 @@ async def load_nodes_from_redis(r: redis.Redis, cfg: Config) -> Dict[str, Dict[s
     forced to offline — the next successful poll will re-confirm whichever
     are actually online.
     """
+    now = now_ms()
     raw = await r.hgetall(cfg.nodes_key)
     out: Dict[str, Dict[str, Any]] = {}
     for cs, val in raw.items():
@@ -623,6 +634,10 @@ async def load_nodes_from_redis(r: redis.Redis, cfg: Config) -> Dict[str, Dict[s
         st["online"] = False
         st["isTalker"] = False
         st["tg"] = 0
+        # Preserve when the node originally went offline so the prune clock
+        # isn't reset by a restart; nodes that were online at shutdown start
+        # their clock now.
+        st.setdefault("offline_since_ms", now)
         out[str(cs).upper()] = st
     return out
 
@@ -703,6 +718,7 @@ async def mark_all_nodes_offline(
     """
     Set all nodes to offline/isTalker False and broadcast + persist diffs.
     """
+    now = now_ms()
     new_nodes = dict(prev_nodes)
     for cs, st in list(new_nodes.items()):
         if st.get("online") is True or st.get("isTalker") is True or st.get("tg", 0) != 0:
@@ -710,6 +726,7 @@ async def mark_all_nodes_offline(
             off["online"] = False
             off["isTalker"] = False
             off["tg"] = 0
+            off["offline_since_ms"] = st.get("offline_since_ms") or now
             new_nodes[cs] = off
 
     changes = diff_nodes(prev_nodes, new_nodes)
@@ -718,6 +735,73 @@ async def mark_all_nodes_offline(
 
     await node_cache.replace(new_nodes)
     await save_nodes_to_redis(r, cfg, changes)
+    return new_nodes
+
+
+async def prune_stale_offline_nodes(
+    r: redis.Redis,
+    cfg: Config,
+    hub: Hub,
+    node_cache: NodeCache,
+    prev_nodes: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Remove nodes that have been offline for at least cfg.offline_prune_after_s.
+
+    Dropped nodes are deleted from the in-memory cache and the Redis roster
+    (so they no longer appear in snapshots or survive restarts) and a
+    `node_remove` event is broadcast so live clients can drop them too.
+
+    Offline nodes with no recorded `offline_since_ms` (e.g. persisted before
+    this feature existed) get their clock started now rather than being pruned
+    immediately.
+    """
+    if cfg.offline_prune_after_s <= 0:
+        return prev_nodes
+
+    now = now_ms()
+    cutoff = now - int(cfg.offline_prune_after_s * 1000)
+
+    to_remove: List[str] = []
+    to_stamp: List[Tuple[str, Dict[str, Any]]] = []
+    for cs, st in prev_nodes.items():
+        if st.get("online") is True:
+            continue
+        since = st.get("offline_since_ms")
+        if since is None:
+            stamped = dict(st)
+            stamped["offline_since_ms"] = now
+            to_stamp.append((cs, stamped))
+        elif since <= cutoff:
+            to_remove.append(cs)
+
+    if not to_remove and not to_stamp:
+        return prev_nodes
+
+    new_nodes = dict(prev_nodes)
+    for cs, stamped in to_stamp:
+        new_nodes[cs] = stamped
+    for cs in to_remove:
+        new_nodes.pop(cs, None)
+
+    if to_remove:
+        await r.hdel(cfg.nodes_key, *to_remove)
+    if to_stamp:
+        await save_nodes_to_redis(r, cfg, to_stamp)
+
+    await node_cache.replace(new_nodes)
+
+    for cs in to_remove:
+        await hub.broadcast({"type": "node_remove", "callsign": cs})
+
+    if to_remove:
+        logging.getLogger("svx_talker_ws").info(
+            "Pruned %d node(s) offline >= %.0fs: %s",
+            len(to_remove),
+            cfg.offline_prune_after_s,
+            ", ".join(sorted(to_remove)),
+        )
+
     return new_nodes
 
 
@@ -756,6 +840,7 @@ async def poll_task(
     failure_count = 0
     stale_applied = False
     last_fail_log_m = 0.0
+    last_prune_m = 0.0
 
     timeout = aiohttp.ClientTimeout(total=5)
 
@@ -867,12 +952,14 @@ async def poll_task(
                     new_nodes[cs] = st
 
                 # mark offline nodes (keep last known coords/location/monitoredTGs for UI)
+                offline_stamp = now_ms()
                 for cs in went_offline:
                     prev = new_nodes.get(cs, {"callsign": cs})
                     off = dict(prev)
                     off["online"] = False
                     off["isTalker"] = False
                     off["tg"] = 0
+                    off["offline_since_ms"] = prev.get("offline_since_ms") or offline_stamp
                     new_nodes[cs] = off
 
                 # broadcast diffs only + persist them
@@ -883,6 +970,14 @@ async def poll_task(
                 prev_nodes = new_nodes
                 await node_cache.replace(prev_nodes)
                 await save_nodes_to_redis(r, cfg, changes)
+
+                # Periodically drop nodes that have been offline too long.
+                now_m = time.monotonic()
+                if (now_m - last_prune_m) >= 60.0:
+                    last_prune_m = now_m
+                    prev_nodes = await prune_stale_offline_nodes(
+                        r, cfg, hub, node_cache, prev_nodes
+                    )
 
                 # sleep to maintain configured poll interval
                 elapsed = time.monotonic() - loop_start

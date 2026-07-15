@@ -183,7 +183,10 @@ websocat wss://ws.example.com
 ```
 
 On connect, the server sends a `snapshot` message; thereafter you'll receive
-`node_upsert`, `talk_start`, and `talk_stop` events live.
+`node_upsert`, `talk_start`, `talk_stop`, and `node_remove` events live. A
+`node_remove` (`{"type":"node_remove","callsign":"ON0XXX"}`) is sent when a node
+has been offline longer than `SVX_OFFLINE_PRUNE_AFTER`; clients should drop that
+callsign from their local roster.
 
 ## Environment variables
 
@@ -194,6 +197,7 @@ On connect, the server sends a `snapshot` message; thereafter you'll receive
 | `REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis connection |
 | `SVX_TTL_SECONDS` | `86400` | Session retention (s) |
 | `SVX_SNAPSHOT_LIMIT` | `500` | Max sessions in connect snapshot |
+| `SVX_OFFLINE_PRUNE_AFTER` | `86400` | Drop nodes offline for at least this many seconds (`0` keeps them forever) |
 | `SVX_WS_HOST` | `127.0.0.1` | WS bind host |
 | `SVX_WS_PORT` | `8765` | WS bind port |
 | `SVX_STATUS_STALE_AFTER` | `3.0` | Mark nodes offline after this many seconds without a successful poll |
@@ -202,6 +206,28 @@ On connect, the server sends a `snapshot` message; thereafter you'll receive
 | `WS_NOISE_REPORT_INTERVAL` | `60` | Periodic summary of suppressed non-WS HTTP hits (`0` disables) |
 | `SVX_AI_CHANNEL` | `svx:ai:events` | Pub/sub channel for SvxLink-AI sessions |
 | `SVX_AI_LINGER_SECONDS` | `1.5` | How long an AI-detected callsign stays "talking" on the WS |
+
+## Maintenance
+
+Nodes that stay offline longer than `SVX_OFFLINE_PRUNE_AFTER` (default 24h) are
+dropped automatically, emitting a `node_remove` event. To clear offline nodes on
+demand — e.g. a backlog from before the auto-prune existed — use the helper
+(run it with the same interpreter as the service so `redis` is available):
+
+```bash
+# Dry run (safe): report what would be removed
+/opt/svx-talker-ws/.venv/bin/python remove_offline_nodes.py
+
+# Remove all offline nodes
+/opt/svx-talker-ws/.venv/bin/python remove_offline_nodes.py --apply
+
+# Remove only nodes offline for at least 24h (7d, 30m, 3600 also accepted)
+/opt/svx-talker-ws/.venv/bin/python remove_offline_nodes.py --older-than 24h --apply
+```
+
+It honours `REDIS_URL` and `SVX_NODES_KEY`. Since the running feed caches the
+roster in memory, restart it afterwards so live clients stop seeing the removed
+nodes: `sudo systemctl restart svx-talker-ws`.
 
 ## License
 
