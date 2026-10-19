@@ -47,6 +47,21 @@ Node state format:
   "offline_since_ms": 1700000000000   // present only while offline
 }
 
+A node without a real position (lat/long 0,0, e.g. an EchoLink bridge) gets
+lat/lon null, so clients never place it at 0,0.
+
+Bridged talkers: when a bridge node (EchoLink, D-STAR, ...) talks with a
+talker alias set (SvxReflector /status "talkerAlias"), the talker is the
+pseudo-node "<node>/<alias>", e.g. "ECHOLINK/ON6URE", not the bridge itself.
+It has its own node state, sessions and last-heard, one per alias, plus:
+  "via": "ECHOLINK",   // the bridge node
+  "alias": "ON6URE"    // the relayed station
+It is online only while it talks and is pruned like any other offline node.
+It takes the position and location of the reflector node named like the alias
+when that node has one; otherwise its lat/lon are null. The bridge node itself
+does not show isTalker while one of its relayed stations talks. A blocked alias
+("talkerAliasBlocked") never talks, so it never shows up.
+
 Redis keys:
 - svx:session:<start_ms>:<callsign>  -> JSON session record, EX TTL
 - svx:sessions                       -> ZSET index (score=start_ms, member=session_key)
@@ -81,6 +96,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import time
 from dataclasses import dataclass
@@ -261,11 +277,14 @@ def summarize_node(node: Dict[str, Any]) -> Dict[str, Any]:
         pos = q0.get("pos") or {}
         if not isinstance(pos, dict):
             pos = {}
+        lat, long = pos.get("lat"), pos.get("long")
+        if to_float(lat) == 0 and to_float(long) == 0:
+            lat = long = None  # no real position (e.g. a bridge node)
         qth_summary = {
             "name": q0.get("name"),
             "loc": pos.get("loc"),
-            "lat": pos.get("lat"),
-            "long": pos.get("long"),
+            "lat": lat,
+            "long": long,
         }
 
     return {
@@ -283,8 +302,11 @@ def summarize_node(node: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def make_node_state(callsign: str, node: Dict[str, Any], online: bool) -> Dict[str, Any]:
-    """Stable node state for the UI (avoid fields that change every poll)."""
+def qth_coords(node: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    lat/lon of the node's first QTH. 0,0 is what a node without a real
+    position reports (e.g. an EchoLink bridge), so it counts as unknown.
+    """
     lat = lon = None
     qth = node.get("qth") or []
     if isinstance(qth, list) and qth and isinstance(qth[0], dict):
@@ -292,6 +314,14 @@ def make_node_state(callsign: str, node: Dict[str, Any], online: bool) -> Dict[s
         if isinstance(pos, dict):
             lat = to_float(pos.get("lat"))
             lon = to_float(pos.get("long"))
+    if lat == 0 and lon == 0:
+        return None, None
+    return lat, lon
+
+
+def make_node_state(callsign: str, node: Dict[str, Any], online: bool) -> Dict[str, Any]:
+    """Stable node state for the UI (avoid fields that change every poll)."""
+    lat, lon = qth_coords(node)
 
     monitored = node.get("monitoredTGs") or []
     if not isinstance(monitored, list):
@@ -320,6 +350,71 @@ def make_node_state(callsign: str, node: Dict[str, Any], online: bool) -> Dict[s
         "lat": lat,
         "lon": lon,
     }
+
+
+# Charset and length SvxReflector allows for a talker alias.
+TALKER_ALIAS_RE = re.compile(r"[A-Z0-9/-]{1,16}")
+
+
+def talker_alias(node: Dict[str, Any]) -> Optional[str]:
+    """
+    The station a bridge node says it is relaying (SvxReflector /status
+    "talkerAlias"), or None. A blocked alias ("talkerAliasBlocked") never
+    becomes talker, so it counts as no alias.
+    """
+    if node.get("talkerAliasBlocked") is True:
+        return None
+    alias = node.get("talkerAlias")
+    if not isinstance(alias, str):
+        return None
+    alias = alias.strip().upper()
+    return alias if TALKER_ALIAS_RE.fullmatch(alias) else None
+
+
+def make_relay_state(
+    bridge: Dict[str, Any],
+    alias: str,
+    home: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Node state for a station talking through a bridge node, keyed
+    "<bridge>/<alias>" ("ECHOLINK/ON6URE"). It is online only while it talks.
+    It never gets the bridge's QTH: it takes the position and location of
+    `home`, the reflector node named like the alias, when that node has a
+    position, and otherwise has none so it stays off the map.
+    """
+    tg = bridge["tg"]
+    st = {
+        "callsign": f"{bridge['callsign']}/{alias}",
+        "online": True,
+        "isTalker": True,
+        "tg": tg,
+        "monitoredTGs": [tg] if tg else [],
+        "location": bridge["location"],
+        "lat": None,
+        "lon": None,
+        "via": bridge["callsign"],
+        "alias": alias,
+    }
+    if home and home.get("lat") is not None and home.get("lon") is not None:
+        st["lat"], st["lon"] = home["lat"], home["lon"]
+        st["location"] = home.get("location") or st["location"]
+    return st
+
+
+def summarize_relay(bridge_node: Dict[str, Any], relay: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Session `node` block for a relayed station: the bridge's summary, with the
+    station's own location and position in place of the bridge's QTH.
+    """
+    summary = summarize_node(bridge_node)
+    summary["nodeLocation"] = relay["location"]
+    summary["qth"] = (
+        {"name": None, "loc": None, "lat": relay["lat"], "long": relay["lon"]}
+        if relay["lat"] is not None
+        else None
+    )
+    return summary
 
 
 @dataclass(frozen=True)
@@ -866,6 +961,7 @@ async def poll_task(
 
                 current_online: Dict[str, Dict[str, Any]] = {}
                 talker_raw: Dict[str, Dict[str, Any]] = {}
+                relayed: List[Tuple[Dict[str, Any], str, Dict[str, Any]]] = []
 
                 for cs, node in nodes.items():
                     if not isinstance(node, dict):
@@ -877,7 +973,24 @@ async def poll_task(
                     st = make_node_state(callsign, node, online=True)
                     current_online[callsign] = st
                     if st["isTalker"]:
-                        talker_raw[callsign] = node
+                        alias = talker_alias(node)
+                        if alias:
+                            # A bridge relaying a station: the talker is
+                            # "<node>/<alias>", not the bridge itself.
+                            st["isTalker"] = False
+                            relayed.append((st, alias, node))
+                        else:
+                            talker_raw[callsign] = node
+
+                # Relayed stations become pseudo-nodes of their own, so their
+                # sessions, last-heard and online state are tracked per alias.
+                for bridge_st, alias, node in relayed:
+                    home = current_online.get(alias) or prev_nodes.get(alias)
+                    if home and home.get("via"):
+                        home = None  # only a real reflector node has a home position
+                    rst = make_relay_state(bridge_st, alias, home)
+                    current_online[rst["callsign"]] = rst
+                    talker_raw[rst["callsign"]] = node
 
                 now_talkers = {cs for cs, st in current_online.items() if st["isTalker"]}
                 started = now_talkers - prev_talkers
@@ -887,6 +1000,8 @@ async def poll_task(
                 for callsign in sorted(started):
                     start_ms = now_ms()
                     session_key = f"{cfg.session_prefix}:{start_ms}:{callsign}"
+                    st = current_online[callsign]
+                    raw = talker_raw.get(callsign, {})
                     record = {
                         "callsign": callsign,
                         "start_ms": start_ms,
@@ -894,8 +1009,11 @@ async def poll_task(
                         "end_ms": None,
                         "end": None,
                         "active": True,
-                        "node": summarize_node(talker_raw.get(callsign, {})),
+                        "node": summarize_relay(raw, st) if st.get("via") else summarize_node(raw),
                     }
+                    if st.get("via"):
+                        record["via"] = st["via"]
+                        record["alias"] = st["alias"]
 
                     pipe = r.pipeline()
                     pipe.set(session_key, json.dumps(record, ensure_ascii=False), ex=cfg.ttl_seconds)

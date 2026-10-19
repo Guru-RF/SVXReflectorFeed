@@ -188,6 +188,29 @@ On connect, the server sends a `snapshot` message; thereafter you'll receive
 has been offline longer than `SVX_OFFLINE_PRUNE_AFTER`; clients should drop that
 callsign from their local roster.
 
+A node without a real position (QTH lat/long `0.0`, e.g. an EchoLink bridge)
+gets `lat`/`lon` `null`, so clients don't place it at 0,0.
+
+## Bridged talkers
+
+A bridge node (EchoLink, D-STAR, ...) tells the reflector which station it is
+relaying before each over, and SvxReflector reports it as `talkerAlias` on that
+node in `/status`. While such a node talks with an alias, the feed reports the
+talker as the pseudo-node `<node>/<alias>`, e.g. `ECHOLINK/ON6URE`, instead of
+the bridge itself. Every alias gets its own node state, sessions and last-heard,
+so ON6URE and ON4ABC via EchoLink are separate entries. The pseudo-node and its
+sessions carry `"via": "ECHOLINK"` and `"alias": "ON6URE"`.
+
+- The pseudo-node is online only while it talks, and is pruned like any other
+  offline node.
+- It takes the position and location of the reflector node named like the
+  alias (`ON6URE`) when that node has one; otherwise its `lat`/`lon` are `null`.
+- The bridge node itself does not show `isTalker` while one of its relayed
+  stations talks.
+- Without an alias (or on reflector builds without `talkerAlias`) nothing
+  changes. A blocked alias (`talkerAliasBlocked`) never talks, so it never shows
+  up.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
